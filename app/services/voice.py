@@ -1,0 +1,2484 @@
+﻿import asyncio
+import os
+import re
+from datetime import datetime
+from typing import Union
+from xml.sax.saxutils import unescape
+
+# Suppress warnings and handle CUDA library conflicts
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
+warnings.filterwarnings("ignore", message=".*audio is shorter than 30s.*")
+os.environ["PYANNOTE_CACHE"] = "/tmp/pyannote"
+# Handle CUDA library conflicts gracefully
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"  # Reduce CUDA memory issues
+# Set environment variable to handle cuDNN version mismatches
+os.environ["CUDNN_LOGINFO_DBG"] = "0"  # Suppress cuDNN debug info
+
+import edge_tts
+import requests
+from edge_tts import SubMaker
+try:
+    from edge_tts.submaker import mktimestamp
+except ImportError:
+    # Fallback for newer edge_tts versions where submaker.mktimestamp is removed.
+    # Input is typically 100-nanosecond ticks from edge events.
+    def mktimestamp(offset):
+        try:
+            if isinstance(offset, str):
+                offset = float(offset)
+            # If it looks like ticks, convert to seconds.
+            seconds = float(offset) / 10000000.0 if float(offset) > 1000 else float(offset)
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            millis = int((seconds - int(seconds)) * 1000)
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+        except Exception:
+            return "00:00:00.000"
+from loguru import logger
+from moviepy.video.tools import subtitles
+
+from app.config import config
+from app.utils import utils
+
+# Import Chatterbox TTS and WhisperX if available
+try:
+    from chatterbox.tts import ChatterboxTTS
+    import whisperx
+    import torch
+    import torchaudio
+    # PyTorch >=2.6 changed default torch.load(weights_only=True), which breaks
+    # some WhisperX/SpeechBrain checkpoints. Force backward-compatible behavior.
+    _orig_torch_load = torch.load
+    def _torch_load_compat(*args, **kwargs):
+        if "weights_only" not in kwargs:
+            kwargs["weights_only"] = False
+        return _orig_torch_load(*args, **kwargs)
+    torch.load = _torch_load_compat
+    CHATTERBOX_AVAILABLE = True
+    logger.info("Chatterbox TTS and WhisperX are available")
+except ImportError as e:
+    CHATTERBOX_AVAILABLE = False
+    logger.warning(f"Chatterbox TTS or WhisperX not available: {e}")
+
+# Global Chatterbox model instance
+chatterbox_model = None
+whisperx_model = None
+last_tts_error = ""
+
+
+def _set_last_tts_error(message: str):
+    global last_tts_error
+    last_tts_error = (message or "").strip()
+
+
+def get_last_tts_error() -> str:
+    return last_tts_error
+
+
+def _prepare_torch_deserialization_for_whisperx():
+    """
+    Make WhisperX checkpoint loading compatible with PyTorch>=2.6 where
+    torch.load defaults to weights_only=True.
+    """
+    if not CHATTERBOX_AVAILABLE:
+        return
+
+    try:
+        # Allow trusted OmegaConf objects used inside WhisperX checkpoints.
+        from omegaconf.listconfig import ListConfig
+        from omegaconf.dictconfig import DictConfig
+        torch.serialization.add_safe_globals([ListConfig, DictConfig])
+    except Exception as e:
+        logger.debug(f"Skipping torch safe globals patch: {e}")
+
+    # Force legacy behavior for trusted local model checkpoints.
+    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
+
+def ensure_submaker_compatibility(sub_maker):
+    """Ensure SubMaker has required attributes for compatibility with different edge_tts versions"""
+    if not hasattr(sub_maker, 'subs'):
+        sub_maker.subs = []
+    if not hasattr(sub_maker, 'offset'):
+        sub_maker.offset = []
+    return sub_maker
+
+
+def get_siliconflow_voices() -> list[str]:
+    """
+    èŽ·å–ç¡…åŸºæµåŠ¨çš„å£°éŸ³åˆ—è¡¨
+
+    Returns:
+        å£°éŸ³åˆ—è¡¨ï¼Œæ ¼å¼ä¸º ["siliconflow:FunAudioLLM/CosyVoice2-0.5B:alex", ...]
+    """
+    # ç¡…åŸºæµåŠ¨çš„å£°éŸ³åˆ—è¡¨å’Œå¯¹åº”çš„æ€§åˆ«ï¼ˆç”¨äºŽæ˜¾ç¤ºï¼‰
+    voices_with_gender = [
+        ("FunAudioLLM/CosyVoice2-0.5B", "alex", "Male"),
+        ("FunAudioLLM/CosyVoice2-0.5B", "anna", "Female"),
+        ("FunAudioLLM/CosyVoice2-0.5B", "bella", "Female"),
+        ("FunAudioLLM/CosyVoice2-0.5B", "benjamin", "Male"),
+        ("FunAudioLLM/CosyVoice2-0.5B", "charles", "Male"),
+        ("FunAudioLLM/CosyVoice2-0.5B", "claire", "Female"),
+        ("FunAudioLLM/CosyVoice2-0.5B", "david", "Male"),
+        ("FunAudioLLM/CosyVoice2-0.5B", "diana", "Female"),
+    ]
+
+    # æ·»åŠ siliconflow:å‰ç¼€ï¼Œå¹¶æ ¼å¼åŒ–ä¸ºæ˜¾ç¤ºåç§°
+    return [
+        f"siliconflow:{model}:{voice}-{gender}"
+        for model, voice, gender in voices_with_gender
+    ]
+
+
+def get_chatterbox_voices() -> list[str]:
+    """
+    èŽ·å–Chatterbox TTSçš„å£°éŸ³åˆ—è¡¨
+
+    Returns:
+        å£°éŸ³åˆ—è¡¨ï¼Œæ ¼å¼ä¸º ["chatterbox:default:Default Voice", "chatterbox:clone:Voice Clone", ...]
+    """
+    if not CHATTERBOX_AVAILABLE:
+        return []
+    
+    voices = [
+        "chatterbox:default:Default Voice-Neutral",
+        "chatterbox:clone:Voice Clone-Custom"
+    ]
+    
+    # Add reference audio files from reference_audio directory if available
+    reference_audio_dir = os.path.join(utils.root_dir(), "reference_audio")
+    if os.path.exists(reference_audio_dir):
+        for file in os.listdir(reference_audio_dir):
+            if file.lower().endswith(('.wav', '.mp3', '.flac', '.m4a')):
+                name = os.path.splitext(file)[0]
+                voices.append(f"chatterbox:clone:{name}-Custom")
+    
+    return voices
+
+
+def get_all_azure_voices(filter_locals=None) -> list[str]:
+    azure_voices_str = """
+Name: af-ZA-AdriNeural
+Gender: Female
+
+Name: af-ZA-WillemNeural
+Gender: Male
+
+Name: am-ET-AmehaNeural
+Gender: Male
+
+Name: am-ET-MekdesNeural
+Gender: Female
+
+Name: ar-AE-FatimaNeural
+Gender: Female
+
+Name: ar-AE-HamdanNeural
+Gender: Male
+
+Name: ar-BH-AliNeural
+Gender: Male
+
+Name: ar-BH-LailaNeural
+Gender: Female
+
+Name: ar-DZ-AminaNeural
+Gender: Female
+
+Name: ar-DZ-IsmaelNeural
+Gender: Male
+
+Name: ar-EG-SalmaNeural
+Gender: Female
+
+Name: ar-EG-ShakirNeural
+Gender: Male
+
+Name: ar-IQ-BasselNeural
+Gender: Male
+
+Name: ar-IQ-RanaNeural
+Gender: Female
+
+Name: ar-JO-SanaNeural
+Gender: Female
+
+Name: ar-JO-TaimNeural
+Gender: Male
+
+Name: ar-KW-FahedNeural
+Gender: Male
+
+Name: ar-KW-NouraNeural
+Gender: Female
+
+Name: ar-LB-LaylaNeural
+Gender: Female
+
+Name: ar-LB-RamiNeural
+Gender: Male
+
+Name: ar-LY-ImanNeural
+Gender: Female
+
+Name: ar-LY-OmarNeural
+Gender: Male
+
+Name: ar-MA-JamalNeural
+Gender: Male
+
+Name: ar-MA-MounaNeural
+Gender: Female
+
+Name: ar-OM-AbdullahNeural
+Gender: Male
+
+Name: ar-OM-AyshaNeural
+Gender: Female
+
+Name: ar-QA-AmalNeural
+Gender: Female
+
+Name: ar-QA-MoazNeural
+Gender: Male
+
+Name: ar-SA-HamedNeural
+Gender: Male
+
+Name: ar-SA-ZariyahNeural
+Gender: Female
+
+Name: ar-SY-AmanyNeural
+Gender: Female
+
+Name: ar-SY-LaithNeural
+Gender: Male
+
+Name: ar-TN-HediNeural
+Gender: Male
+
+Name: ar-TN-ReemNeural
+Gender: Female
+
+Name: ar-YE-MaryamNeural
+Gender: Female
+
+Name: ar-YE-SalehNeural
+Gender: Male
+
+Name: az-AZ-BabekNeural
+Gender: Male
+
+Name: az-AZ-BanuNeural
+Gender: Female
+
+Name: bg-BG-BorislavNeural
+Gender: Male
+
+Name: bg-BG-KalinaNeural
+Gender: Female
+
+Name: bn-BD-NabanitaNeural
+Gender: Female
+
+Name: bn-BD-PradeepNeural
+Gender: Male
+
+Name: bn-IN-BashkarNeural
+Gender: Male
+
+Name: bn-IN-TanishaaNeural
+Gender: Female
+
+Name: bs-BA-GoranNeural
+Gender: Male
+
+Name: bs-BA-VesnaNeural
+Gender: Female
+
+Name: ca-ES-EnricNeural
+Gender: Male
+
+Name: ca-ES-JoanaNeural
+Gender: Female
+
+Name: cs-CZ-AntoninNeural
+Gender: Male
+
+Name: cs-CZ-VlastaNeural
+Gender: Female
+
+Name: cy-GB-AledNeural
+Gender: Male
+
+Name: cy-GB-NiaNeural
+Gender: Female
+
+Name: da-DK-ChristelNeural
+Gender: Female
+
+Name: da-DK-JeppeNeural
+Gender: Male
+
+Name: de-AT-IngridNeural
+Gender: Female
+
+Name: de-AT-JonasNeural
+Gender: Male
+
+Name: de-CH-JanNeural
+Gender: Male
+
+Name: de-CH-LeniNeural
+Gender: Female
+
+Name: de-DE-AmalaNeural
+Gender: Female
+
+Name: de-DE-ConradNeural
+Gender: Male
+
+Name: de-DE-FlorianMultilingualNeural
+Gender: Male
+
+Name: de-DE-KatjaNeural
+Gender: Female
+
+Name: de-DE-KillianNeural
+Gender: Male
+
+Name: de-DE-SeraphinaMultilingualNeural
+Gender: Female
+
+Name: el-GR-AthinaNeural
+Gender: Female
+
+Name: el-GR-NestorasNeural
+Gender: Male
+
+Name: en-AU-NatashaNeural
+Gender: Female
+
+Name: en-AU-WilliamNeural
+Gender: Male
+
+Name: en-CA-ClaraNeural
+Gender: Female
+
+Name: en-CA-LiamNeural
+Gender: Male
+
+Name: en-GB-LibbyNeural
+Gender: Female
+
+Name: en-GB-MaisieNeural
+Gender: Female
+
+Name: en-GB-RyanNeural
+Gender: Male
+
+Name: en-GB-SoniaNeural
+Gender: Female
+
+Name: en-GB-ThomasNeural
+Gender: Male
+
+Name: en-HK-SamNeural
+Gender: Male
+
+Name: en-HK-YanNeural
+Gender: Female
+
+Name: en-IE-ConnorNeural
+Gender: Male
+
+Name: en-IE-EmilyNeural
+Gender: Female
+
+Name: en-IN-NeerjaExpressiveNeural
+Gender: Female
+
+Name: en-IN-NeerjaNeural
+Gender: Female
+
+Name: en-IN-PrabhatNeural
+Gender: Male
+
+Name: en-KE-AsiliaNeural
+Gender: Female
+
+Name: en-KE-ChilembaNeural
+Gender: Male
+
+Name: en-NG-AbeoNeural
+Gender: Male
+
+Name: en-NG-EzinneNeural
+Gender: Female
+
+Name: en-NZ-MitchellNeural
+Gender: Male
+
+Name: en-NZ-MollyNeural
+Gender: Female
+
+Name: en-PH-JamesNeural
+Gender: Male
+
+Name: en-PH-RosaNeural
+Gender: Female
+
+Name: en-SG-LunaNeural
+Gender: Female
+
+Name: en-SG-WayneNeural
+Gender: Male
+
+Name: en-TZ-ElimuNeural
+Gender: Male
+
+Name: en-TZ-ImaniNeural
+Gender: Female
+
+Name: en-US-AnaNeural
+Gender: Female
+
+Name: en-US-AndrewMultilingualNeural
+Gender: Male
+
+Name: en-US-AndrewNeural
+Gender: Male
+
+Name: en-US-AriaNeural
+Gender: Female
+
+Name: en-US-AvaMultilingualNeural
+Gender: Female
+
+Name: en-US-AvaNeural
+Gender: Female
+
+Name: en-US-BrianMultilingualNeural
+Gender: Male
+
+Name: en-US-BrianNeural
+Gender: Male
+
+Name: en-US-ChristopherNeural
+Gender: Male
+
+Name: en-US-EmmaMultilingualNeural
+Gender: Female
+
+Name: en-US-EmmaNeural
+Gender: Female
+
+Name: en-US-EricNeural
+Gender: Male
+
+Name: en-US-GuyNeural
+Gender: Male
+
+Name: en-US-JennyNeural
+Gender: Female
+
+Name: en-US-MichelleNeural
+Gender: Female
+
+Name: en-US-RogerNeural
+Gender: Male
+
+Name: en-US-SteffanNeural
+Gender: Male
+
+Name: en-ZA-LeahNeural
+Gender: Female
+
+Name: en-ZA-LukeNeural
+Gender: Male
+
+Name: es-AR-ElenaNeural
+Gender: Female
+
+Name: es-AR-TomasNeural
+Gender: Male
+
+Name: es-BO-MarceloNeural
+Gender: Male
+
+Name: es-BO-SofiaNeural
+Gender: Female
+
+Name: es-CL-CatalinaNeural
+Gender: Female
+
+Name: es-CL-LorenzoNeural
+Gender: Male
+
+Name: es-CO-GonzaloNeural
+Gender: Male
+
+Name: es-CO-SalomeNeural
+Gender: Female
+
+Name: es-CR-JuanNeural
+Gender: Male
+
+Name: es-CR-MariaNeural
+Gender: Female
+
+Name: es-CU-BelkysNeural
+Gender: Female
+
+Name: es-CU-ManuelNeural
+Gender: Male
+
+Name: es-DO-EmilioNeural
+Gender: Male
+
+Name: es-DO-RamonaNeural
+Gender: Female
+
+Name: es-EC-AndreaNeural
+Gender: Female
+
+Name: es-EC-LuisNeural
+Gender: Male
+
+Name: es-ES-AlvaroNeural
+Gender: Male
+
+Name: es-ES-ElviraNeural
+Gender: Female
+
+Name: es-ES-XimenaNeural
+Gender: Female
+
+Name: es-GQ-JavierNeural
+Gender: Male
+
+Name: es-GQ-TeresaNeural
+Gender: Female
+
+Name: es-GT-AndresNeural
+Gender: Male
+
+Name: es-GT-MartaNeural
+Gender: Female
+
+Name: es-HN-CarlosNeural
+Gender: Male
+
+Name: es-HN-KarlaNeural
+Gender: Female
+
+Name: es-MX-DaliaNeural
+Gender: Female
+
+Name: es-MX-JorgeNeural
+Gender: Male
+
+Name: es-NI-FedericoNeural
+Gender: Male
+
+Name: es-NI-YolandaNeural
+Gender: Female
+
+Name: es-PA-MargaritaNeural
+Gender: Female
+
+Name: es-PA-RobertoNeural
+Gender: Male
+
+Name: es-PE-AlexNeural
+Gender: Male
+
+Name: es-PE-CamilaNeural
+Gender: Female
+
+Name: es-PR-KarinaNeural
+Gender: Female
+
+Name: es-PR-VictorNeural
+Gender: Male
+
+Name: es-PY-MarioNeural
+Gender: Male
+
+Name: es-PY-TaniaNeural
+Gender: Female
+
+Name: es-SV-LorenaNeural
+Gender: Female
+
+Name: es-SV-RodrigoNeural
+Gender: Male
+
+Name: es-US-AlonsoNeural
+Gender: Male
+
+Name: es-US-PalomaNeural
+Gender: Female
+
+Name: es-UY-MateoNeural
+Gender: Male
+
+Name: es-UY-ValentinaNeural
+Gender: Female
+
+Name: es-VE-PaolaNeural
+Gender: Female
+
+Name: es-VE-SebastianNeural
+Gender: Male
+
+Name: et-EE-AnuNeural
+Gender: Female
+
+Name: et-EE-KertNeural
+Gender: Male
+
+Name: fa-IR-DilaraNeural
+Gender: Female
+
+Name: fa-IR-FaridNeural
+Gender: Male
+
+Name: fi-FI-HarriNeural
+Gender: Male
+
+Name: fi-FI-NooraNeural
+Gender: Female
+
+Name: fil-PH-AngeloNeural
+Gender: Male
+
+Name: fil-PH-BlessicaNeural
+Gender: Female
+
+Name: fr-BE-CharlineNeural
+Gender: Female
+
+Name: fr-BE-GerardNeural
+Gender: Male
+
+Name: fr-CA-AntoineNeural
+Gender: Male
+
+Name: fr-CA-JeanNeural
+Gender: Male
+
+Name: fr-CA-SylvieNeural
+Gender: Female
+
+Name: fr-CA-ThierryNeural
+Gender: Male
+
+Name: fr-CH-ArianeNeural
+Gender: Female
+
+Name: fr-CH-FabriceNeural
+Gender: Male
+
+Name: fr-FR-DeniseNeural
+Gender: Female
+
+Name: fr-FR-EloiseNeural
+Gender: Female
+
+Name: fr-FR-HenriNeural
+Gender: Male
+
+Name: fr-FR-RemyMultilingualNeural
+Gender: Male
+
+Name: fr-FR-VivienneMultilingualNeural
+Gender: Female
+
+Name: ga-IE-ColmNeural
+Gender: Male
+
+Name: ga-IE-OrlaNeural
+Gender: Female
+
+Name: gl-ES-RoiNeural
+Gender: Male
+
+Name: gl-ES-SabelaNeural
+Gender: Female
+
+Name: gu-IN-DhwaniNeural
+Gender: Female
+
+Name: gu-IN-NiranjanNeural
+Gender: Male
+
+Name: he-IL-AvriNeural
+Gender: Male
+
+Name: he-IL-HilaNeural
+Gender: Female
+
+Name: hi-IN-MadhurNeural
+Gender: Male
+
+Name: hi-IN-SwaraNeural
+Gender: Female
+
+Name: hr-HR-GabrijelaNeural
+Gender: Female
+
+Name: hr-HR-SreckoNeural
+Gender: Male
+
+Name: hu-HU-NoemiNeural
+Gender: Female
+
+Name: hu-HU-TamasNeural
+Gender: Male
+
+Name: id-ID-ArdiNeural
+Gender: Male
+
+Name: id-ID-GadisNeural
+Gender: Female
+
+Name: is-IS-GudrunNeural
+Gender: Female
+
+Name: is-IS-GunnarNeural
+Gender: Male
+
+Name: it-IT-DiegoNeural
+Gender: Male
+
+Name: it-IT-ElsaNeural
+Gender: Female
+
+Name: it-IT-GiuseppeMultilingualNeural
+Gender: Male
+
+Name: it-IT-IsabellaNeural
+Gender: Female
+
+Name: iu-Cans-CA-SiqiniqNeural
+Gender: Female
+
+Name: iu-Cans-CA-TaqqiqNeural
+Gender: Male
+
+Name: iu-Latn-CA-SiqiniqNeural
+Gender: Female
+
+Name: iu-Latn-CA-TaqqiqNeural
+Gender: Male
+
+Name: ja-JP-KeitaNeural
+Gender: Male
+
+Name: ja-JP-NanamiNeural
+Gender: Female
+
+Name: jv-ID-DimasNeural
+Gender: Male
+
+Name: jv-ID-SitiNeural
+Gender: Female
+
+Name: ka-GE-EkaNeural
+Gender: Female
+
+Name: ka-GE-GiorgiNeural
+Gender: Male
+
+Name: kk-KZ-AigulNeural
+Gender: Female
+
+Name: kk-KZ-DauletNeural
+Gender: Male
+
+Name: km-KH-PisethNeural
+Gender: Male
+
+Name: km-KH-SreymomNeural
+Gender: Female
+
+Name: kn-IN-GaganNeural
+Gender: Male
+
+Name: kn-IN-SapnaNeural
+Gender: Female
+
+Name: ko-KR-HyunsuMultilingualNeural
+Gender: Male
+
+Name: ko-KR-InJoonNeural
+Gender: Male
+
+Name: ko-KR-SunHiNeural
+Gender: Female
+
+Name: lo-LA-ChanthavongNeural
+Gender: Male
+
+Name: lo-LA-KeomanyNeural
+Gender: Female
+
+Name: lt-LT-LeonasNeural
+Gender: Male
+
+Name: lt-LT-OnaNeural
+Gender: Female
+
+Name: lv-LV-EveritaNeural
+Gender: Female
+
+Name: lv-LV-NilsNeural
+Gender: Male
+
+Name: mk-MK-AleksandarNeural
+Gender: Male
+
+Name: mk-MK-MarijaNeural
+Gender: Female
+
+Name: ml-IN-MidhunNeural
+Gender: Male
+
+Name: ml-IN-SobhanaNeural
+Gender: Female
+
+Name: mn-MN-BataaNeural
+Gender: Male
+
+Name: mn-MN-YesuiNeural
+Gender: Female
+
+Name: mr-IN-AarohiNeural
+Gender: Female
+
+Name: mr-IN-ManoharNeural
+Gender: Male
+
+Name: ms-MY-OsmanNeural
+Gender: Male
+
+Name: ms-MY-YasminNeural
+Gender: Female
+
+Name: mt-MT-GraceNeural
+Gender: Female
+
+Name: mt-MT-JosephNeural
+Gender: Male
+
+Name: my-MM-NilarNeural
+Gender: Female
+
+Name: my-MM-ThihaNeural
+Gender: Male
+
+Name: nb-NO-FinnNeural
+Gender: Male
+
+Name: nb-NO-PernilleNeural
+Gender: Female
+
+Name: ne-NP-HemkalaNeural
+Gender: Female
+
+Name: ne-NP-SagarNeural
+Gender: Male
+
+Name: nl-BE-ArnaudNeural
+Gender: Male
+
+Name: nl-BE-DenaNeural
+Gender: Female
+
+Name: nl-NL-ColetteNeural
+Gender: Female
+
+Name: nl-NL-FennaNeural
+Gender: Female
+
+Name: nl-NL-MaartenNeural
+Gender: Male
+
+Name: pl-PL-MarekNeural
+Gender: Male
+
+Name: pl-PL-ZofiaNeural
+Gender: Female
+
+Name: ps-AF-GulNawazNeural
+Gender: Male
+
+Name: ps-AF-LatifaNeural
+Gender: Female
+
+Name: pt-BR-AntonioNeural
+Gender: Male
+
+Name: pt-BR-FranciscaNeural
+Gender: Female
+
+Name: pt-BR-ThalitaMultilingualNeural
+Gender: Female
+
+Name: pt-PT-DuarteNeural
+Gender: Male
+
+Name: pt-PT-RaquelNeural
+Gender: Female
+
+Name: ro-RO-AlinaNeural
+Gender: Female
+
+Name: ro-RO-EmilNeural
+Gender: Male
+
+Name: ru-RU-DmitryNeural
+Gender: Male
+
+Name: ru-RU-SvetlanaNeural
+Gender: Female
+
+Name: si-LK-SameeraNeural
+Gender: Male
+
+Name: si-LK-ThiliniNeural
+Gender: Female
+
+Name: sk-SK-LukasNeural
+Gender: Male
+
+Name: sk-SK-ViktoriaNeural
+Gender: Female
+
+Name: sl-SI-PetraNeural
+Gender: Female
+
+Name: sl-SI-RokNeural
+Gender: Male
+
+Name: so-SO-MuuseNeural
+Gender: Male
+
+Name: so-SO-UbaxNeural
+Gender: Female
+
+Name: sq-AL-AnilaNeural
+Gender: Female
+
+Name: sq-AL-IlirNeural
+Gender: Male
+
+Name: sr-RS-NicholasNeural
+Gender: Male
+
+Name: sr-RS-SophieNeural
+Gender: Female
+
+Name: su-ID-JajangNeural
+Gender: Male
+
+Name: su-ID-TutiNeural
+Gender: Female
+
+Name: sv-SE-MattiasNeural
+Gender: Male
+
+Name: sv-SE-SofieNeural
+Gender: Female
+
+Name: sw-KE-RafikiNeural
+Gender: Male
+
+Name: sw-KE-ZuriNeural
+Gender: Female
+
+Name: sw-TZ-DaudiNeural
+Gender: Male
+
+Name: sw-TZ-RehemaNeural
+Gender: Female
+
+Name: ta-IN-PallaviNeural
+Gender: Female
+
+Name: ta-IN-ValluvarNeural
+Gender: Male
+
+Name: ta-LK-KumarNeural
+Gender: Male
+
+Name: ta-LK-SaranyaNeural
+Gender: Female
+
+Name: ta-MY-KaniNeural
+Gender: Female
+
+Name: ta-MY-SuryaNeural
+Gender: Male
+
+Name: ta-SG-AnbuNeural
+Gender: Male
+
+Name: ta-SG-VenbaNeural
+Gender: Female
+
+Name: te-IN-MohanNeural
+Gender: Male
+
+Name: te-IN-ShrutiNeural
+Gender: Female
+
+Name: th-TH-NiwatNeural
+Gender: Male
+
+Name: th-TH-PremwadeeNeural
+Gender: Female
+
+Name: tr-TR-AhmetNeural
+Gender: Male
+
+Name: tr-TR-EmelNeural
+Gender: Female
+
+Name: uk-UA-OstapNeural
+Gender: Male
+
+Name: uk-UA-PolinaNeural
+Gender: Female
+
+Name: ur-IN-GulNeural
+Gender: Female
+
+Name: ur-IN-SalmanNeural
+Gender: Male
+
+Name: ur-PK-AsadNeural
+Gender: Male
+
+Name: ur-PK-UzmaNeural
+Gender: Female
+
+Name: uz-UZ-MadinaNeural
+Gender: Female
+
+Name: uz-UZ-SardorNeural
+Gender: Male
+
+Name: vi-VN-HoaiMyNeural
+Gender: Female
+
+Name: vi-VN-NamMinhNeural
+Gender: Male
+
+Name: zh-CN-XiaoxiaoNeural
+Gender: Female
+
+Name: zh-CN-XiaoyiNeural
+Gender: Female
+
+Name: zh-CN-YunjianNeural
+Gender: Male
+
+Name: zh-CN-YunxiNeural
+Gender: Male
+
+Name: zh-CN-YunxiaNeural
+Gender: Male
+
+Name: zh-CN-YunyangNeural
+Gender: Male
+
+Name: zh-CN-liaoning-XiaobeiNeural
+Gender: Female
+
+Name: zh-CN-shaanxi-XiaoniNeural
+Gender: Female
+
+Name: zh-HK-HiuGaaiNeural
+Gender: Female
+
+Name: zh-HK-HiuMaanNeural
+Gender: Female
+
+Name: zh-HK-WanLungNeural
+Gender: Male
+
+Name: zh-TW-HsiaoChenNeural
+Gender: Female
+
+Name: zh-TW-HsiaoYuNeural
+Gender: Female
+
+Name: zh-TW-YunJheNeural
+Gender: Male
+
+Name: zu-ZA-ThandoNeural
+Gender: Female
+
+Name: zu-ZA-ThembaNeural
+Gender: Male
+
+
+Name: en-US-AvaMultilingualNeural-V2
+Gender: Female
+
+Name: en-US-AndrewMultilingualNeural-V2
+Gender: Male
+
+Name: en-US-EmmaMultilingualNeural-V2
+Gender: Female
+
+Name: en-US-BrianMultilingualNeural-V2
+Gender: Male
+
+Name: de-DE-FlorianMultilingualNeural-V2
+Gender: Male
+
+Name: de-DE-SeraphinaMultilingualNeural-V2
+Gender: Female
+
+Name: fr-FR-RemyMultilingualNeural-V2
+Gender: Male
+
+Name: fr-FR-VivienneMultilingualNeural-V2
+Gender: Female
+
+Name: zh-CN-XiaoxiaoMultilingualNeural-V2
+Gender: Female
+    """.strip()
+    voices = []
+    # å®šä¹‰æ­£åˆ™è¡¨è¾¾å¼æ¨¡å¼ï¼Œç”¨äºŽåŒ¹é… Name å’Œ Gender è¡Œ
+    pattern = re.compile(r"Name:\s*(.+)\s*Gender:\s*(.+)\s*", re.MULTILINE)
+    # ä½¿ç”¨æ­£åˆ™è¡¨è¾¾å¼æŸ¥æ‰¾æ‰€æœ‰åŒ¹é…é¡¹
+    matches = pattern.findall(azure_voices_str)
+
+    for name, gender in matches:
+        # åº”ç”¨è¿‡æ»¤æ¡ä»¶
+        if filter_locals and any(
+            name.lower().startswith(fl.lower()) for fl in filter_locals
+        ):
+            voices.append(f"{name}-{gender}")
+        elif not filter_locals:
+            voices.append(f"{name}-{gender}")
+
+    voices.sort()
+    return voices
+
+
+def parse_voice_name(name: str):
+    # zh-CN-XiaoyiNeural-Female
+    # zh-CN-YunxiNeural-Male
+    # zh-CN-XiaoxiaoMultilingualNeural-V2-Female
+    name = name.replace("-Female", "").replace("-Male", "").strip()
+    return name
+
+
+def is_azure_v2_voice(voice_name: str):
+    voice_name = parse_voice_name(voice_name)
+    if voice_name.endswith("-V2"):
+        return voice_name.replace("-V2", "").strip()
+    return ""
+
+
+def is_siliconflow_voice(voice_name: str):
+    """æ£€æŸ¥æ˜¯å¦æ˜¯ç¡…åŸºæµåŠ¨çš„å£°éŸ³"""
+    return voice_name.startswith("siliconflow:")
+
+
+def is_chatterbox_voice(voice_name: str):
+    """æ£€æŸ¥æ˜¯å¦æ˜¯Chatterboxçš„å£°éŸ³"""
+    return voice_name.startswith("chatterbox:")
+
+
+def tts(
+    text: str,
+    voice_name: str,
+    voice_rate: float,
+    voice_file: str,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    _set_last_tts_error("")
+    if is_azure_v2_voice(voice_name):
+        return azure_tts_v2(text, voice_name, voice_file)
+    elif is_siliconflow_voice(voice_name):
+        # ä»Žvoice_nameä¸­æå–æ¨¡åž‹å’Œå£°éŸ³
+        # æ ¼å¼: siliconflow:model:voice-Gender
+        parts = voice_name.split(":")
+        if len(parts) >= 3:
+            model = parts[1]
+            # ç§»é™¤æ€§åˆ«åŽç¼€ï¼Œä¾‹å¦‚ "alex-Male" -> "alex"
+            voice_with_gender = parts[2]
+            voice = voice_with_gender.split("-")[0]
+            # æž„å»ºå®Œæ•´çš„voiceå‚æ•°ï¼Œæ ¼å¼ä¸º "model:voice"
+            full_voice = f"{model}:{voice}"
+            return siliconflow_tts(
+                text, model, full_voice, voice_rate, voice_file, voice_volume
+            )
+        else:
+            logger.error(f"Invalid siliconflow voice name format: {voice_name}")
+            _set_last_tts_error(f"Invalid siliconflow voice name format: {voice_name}")
+            return None
+    elif is_chatterbox_voice(voice_name):
+        # Chatterbox TTS with WhisperX timestamps
+        # æ ¼å¼: chatterbox:type:name-Gender
+        return chatterbox_tts(text, voice_name, voice_rate, voice_file, voice_volume)
+    return azure_tts_v1(text, voice_name, voice_rate, voice_file)
+
+
+def convert_rate_to_percent(rate: float) -> str:
+    if rate == 1.0:
+        return "+0%"
+    percent = round((rate - 1.0) * 100)
+    if percent > 0:
+        return f"+{percent}%"
+    else:
+        return f"{percent}%"
+
+
+def azure_tts_v1(
+    text: str, voice_name: str, voice_rate: float, voice_file: str
+) -> Union[SubMaker, None]:
+    voice_name = parse_voice_name(voice_name)
+    text = text.strip()
+    rate_str = convert_rate_to_percent(voice_rate)
+    for i in range(3):
+        try:
+            logger.info(f"start, voice name: {voice_name}, try: {i + 1}")
+
+            async def _do() -> SubMaker:
+                communicate = edge_tts.Communicate(text, voice_name, rate=rate_str)
+                sub_maker = ensure_submaker_compatibility(edge_tts.SubMaker())
+                with open(voice_file, "wb") as file:
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            file.write(chunk["data"])
+                        elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
+                            sub_maker.subs.append(chunk["text"])
+                            sub_maker.offset.append((chunk["offset"], chunk["offset"] + chunk["duration"]))
+                return sub_maker
+
+            sub_maker = asyncio.run(_do())
+            if not sub_maker:
+                logger.warning("failed, sub_maker is None")
+                continue
+            if not sub_maker.subs:
+                # Fallback: audio generated but no boundary events returned.
+                if os.path.exists(voice_file) and os.path.getsize(voice_file) > 0:
+                    try:
+                        from moviepy import AudioFileClip
+
+                        audio_clip = AudioFileClip(voice_file)
+                        audio_duration_100ns = int(audio_clip.duration * 10000000)
+                        audio_clip.close()
+
+                        sentences = [s.strip() for s in utils.split_string_by_punctuations(text) if s.strip()]
+                        if not sentences:
+                            sentences = [text]
+
+                        total_chars = sum(len(s) for s in sentences) or 1
+                        current_offset = 0
+                        for sentence in sentences:
+                            dur = int(audio_duration_100ns * (len(sentence) / total_chars))
+                            end = min(audio_duration_100ns, current_offset + max(dur, 1))
+                            sub_maker.subs.append(sentence)
+                            sub_maker.offset.append((current_offset, end))
+                            current_offset = end
+                        if sub_maker.offset:
+                            sub_maker.offset[-1] = (sub_maker.offset[-1][0], audio_duration_100ns)
+                    except Exception as e:
+                        logger.warning(f"failed to build fallback subtitles for edge-tts audio: {e}")
+
+            if not sub_maker.subs:
+                logger.warning("failed, sub_maker.subs is empty")
+                continue
+
+            logger.info(f"completed, output file: {voice_file}")
+            return sub_maker
+        except Exception as e:
+            logger.error(f"failed, error: {str(e)}")
+            err = str(e)
+            if "403" in err and "Invalid response status" in err:
+                _set_last_tts_error(
+                    "Azure TTS V1 (edge_tts) was rejected with HTTP 403 by Microsoft endpoint. "
+                    "Use Azure TTS V2 with Speech key/region, or switch to Chatterbox/SiliconFlow."
+                )
+            else:
+                _set_last_tts_error(f"azure_tts_v1 failed: {err}")
+    return None
+
+
+def siliconflow_tts(
+    text: str,
+    model: str,
+    voice: str,
+    voice_rate: float,
+    voice_file: str,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    """
+    ä½¿ç”¨ç¡…åŸºæµåŠ¨çš„APIç”Ÿæˆè¯­éŸ³
+
+    Args:
+        text: è¦è½¬æ¢ä¸ºè¯­éŸ³çš„æ–‡æœ¬
+        model: æ¨¡åž‹åç§°ï¼Œå¦‚ "FunAudioLLM/CosyVoice2-0.5B"
+        voice: å£°éŸ³åç§°ï¼Œå¦‚ "FunAudioLLM/CosyVoice2-0.5B:alex"
+        voice_rate: è¯­éŸ³é€Ÿåº¦ï¼ŒèŒƒå›´[0.25, 4.0]
+        voice_file: è¾“å‡ºçš„éŸ³é¢‘æ–‡ä»¶è·¯å¾„
+        voice_volume: è¯­éŸ³éŸ³é‡ï¼ŒèŒƒå›´[0.6, 5.0]ï¼Œéœ€è¦è½¬æ¢ä¸ºç¡…åŸºæµåŠ¨çš„å¢žç›ŠèŒƒå›´[-10, 10]
+
+    Returns:
+        SubMakerå¯¹è±¡æˆ–None
+    """
+    text = text.strip()
+    api_key = config.siliconflow.get("api_key", "")
+
+    if not api_key:
+        logger.error("SiliconFlow API key is not set")
+        return None
+
+    # å°†voice_volumeè½¬æ¢ä¸ºç¡…åŸºæµåŠ¨çš„å¢žç›ŠèŒƒå›´
+    # é»˜è®¤voice_volumeä¸º1.0ï¼Œå¯¹åº”gainä¸º0
+    gain = voice_volume - 1.0
+    # ç¡®ä¿gainåœ¨[-10, 10]èŒƒå›´å†…
+    gain = max(-10, min(10, gain))
+
+    url = "https://api.siliconflow.cn/v1/audio/speech"
+
+    payload = {
+        "model": model,
+        "input": text,
+        "voice": voice,
+        "response_format": "mp3",
+        "sample_rate": 32000,
+        "stream": False,
+        "speed": voice_rate,
+        "gain": gain,
+    }
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    for i in range(3):  # å°è¯•3æ¬¡
+        try:
+            logger.info(
+                f"start siliconflow tts, model: {model}, voice: {voice}, try: {i + 1}"
+            )
+
+            response = requests.post(url, json=payload, headers=headers)
+
+            if response.status_code == 200:
+                # ä¿å­˜éŸ³é¢‘æ–‡ä»¶
+                with open(voice_file, "wb") as f:
+                    f.write(response.content)
+
+                # åˆ›å»ºä¸€ä¸ªç©ºçš„SubMakerå¯¹è±¡
+                sub_maker = ensure_submaker_compatibility(SubMaker())
+
+                # èŽ·å–éŸ³é¢‘æ–‡ä»¶çš„å®žé™…é•¿åº¦
+                try:
+                    # å°è¯•ä½¿ç”¨moviepyèŽ·å–éŸ³é¢‘é•¿åº¦
+                    from moviepy import AudioFileClip
+
+                    audio_clip = AudioFileClip(voice_file)
+                    audio_duration = audio_clip.duration
+                    audio_clip.close()
+
+                    # å°†éŸ³é¢‘é•¿åº¦è½¬æ¢ä¸º100çº³ç§’å•ä½ï¼ˆä¸Žedge_ttså…¼å®¹ï¼‰
+                    audio_duration_100ns = int(audio_duration * 10000000)
+
+                    # ä½¿ç”¨æ–‡æœ¬åˆ†å‰²æ¥åˆ›å»ºæ›´å‡†ç¡®çš„å­—å¹•
+                    # å°†æ–‡æœ¬æŒ‰æ ‡ç‚¹ç¬¦å·åˆ†å‰²æˆå¥å­
+                    sentences = utils.split_string_by_punctuations(text)
+
+                    if sentences:
+                        # è®¡ç®—æ¯ä¸ªå¥å­çš„å¤§è‡´æ—¶é•¿ï¼ˆæŒ‰å­—ç¬¦æ•°æ¯”ä¾‹åˆ†é…ï¼‰
+                        total_chars = sum(len(s) for s in sentences)
+                        char_duration = (
+                            audio_duration_100ns / total_chars if total_chars > 0 else 0
+                        )
+
+                        current_offset = 0
+                        for sentence in sentences:
+                            if not sentence.strip():
+                                continue
+
+                            # è®¡ç®—å½“å‰å¥å­çš„æ—¶é•¿
+                            sentence_chars = len(sentence)
+                            sentence_duration = int(sentence_chars * char_duration)
+
+                            # æ·»åŠ åˆ°SubMaker
+                            sub_maker.subs.append(sentence)
+                            sub_maker.offset.append(
+                                (current_offset, current_offset + sentence_duration)
+                            )
+
+                            # æ›´æ–°åç§»é‡
+                            current_offset += sentence_duration
+                    else:
+                        # å¦‚æžœæ— æ³•åˆ†å‰²ï¼Œåˆ™ä½¿ç”¨æ•´ä¸ªæ–‡æœ¬ä½œä¸ºä¸€ä¸ªå­—å¹•
+                        sub_maker.subs = [text]
+                        sub_maker.offset = [(0, audio_duration_100ns)]
+
+                except Exception as e:
+                    logger.warning(f"Failed to create accurate subtitles: {str(e)}")
+                    # å›žé€€åˆ°ç®€å•çš„å­—å¹•
+                    sub_maker.subs = [text]
+                    # ä½¿ç”¨éŸ³é¢‘æ–‡ä»¶çš„å®žé™…é•¿åº¦ï¼Œå¦‚æžœæ— æ³•èŽ·å–ï¼Œåˆ™å‡è®¾ä¸º10ç§’
+                    sub_maker.offset = [
+                        (
+                            0,
+                            audio_duration_100ns
+                            if "audio_duration_100ns" in locals()
+                            else 10000000,
+                        )
+                    ]
+
+                logger.success(f"siliconflow tts succeeded: {voice_file}")
+                return sub_maker
+            else:
+                logger.error(
+                    f"siliconflow tts failed with status code {response.status_code}: {response.text}"
+                )
+        except Exception as e:
+            logger.error(f"siliconflow tts failed: {str(e)}")
+
+    return None
+
+
+def preprocess_text_for_chatterbox(text: str) -> str:
+    """
+    Preprocess text to improve Chatterbox TTS quality and prevent garbled audio
+    
+    Fixes common issues:
+    - Converts numbers to words
+    - Simplifies technical terms
+    - Shortens complex sentences
+    - Reduces punctuation variety
+    - Handles contractions properly
+    """
+    if not text:
+        return text
+    
+    # Clean and normalize text
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Convert number ranges to words
+    number_ranges = {
+        r'\b150-300\b': 'one hundred fifty to three hundred',
+        r'\b75-150\b': 'seventy five to one hundred fifty',
+        r'\b150\b': 'one hundred fifty',
+        r'\b300\b': 'three hundred',
+        r'\b75\b': 'seventy five',
+        r'\b6-7\b': 'six to seven',
+        r'\b30\b': 'thirty',
+        r'\b5\b': 'five',
+        r'\b2\b': 'two'
+    }
+    
+    for pattern, replacement in number_ranges.items():
+        text = re.sub(pattern, replacement, text)
+    
+    # Simplify technical terms
+    technical_replacements = {
+        r'\bmetabolism\b': 'how your body burns calories',
+        r'\bantioxidants\b': 'healthy compounds',
+        r'\bquinoa\b': 'healthy grains',
+        r'\bcardiovascular\b': 'heart and blood vessel',
+        r'\bWorld Health Organization\b': 'health experts',
+        r'\bvigorous cardio\b': 'intense exercise',
+        r'\bmoderate cardio\b': 'gentle exercise',
+        r'\bstrengthening activities\b': 'muscle building exercises',
+        r'\bresistance bands\b': 'exercise bands',
+        r'\bcomplex carbs\b': 'healthy carbs'
+    }
+    
+    for pattern, replacement in technical_replacements.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    
+    # Reduce excessive punctuation
+    text = re.sub(r'!!+', '!', text)  # Multiple exclamations
+    text = re.sub(r'\?\?+', '?', text)  # Multiple questions
+    text = re.sub(r'\.\.+', '.', text)  # Multiple periods
+    
+    # Simplify contractions for better pronunciation
+    contractions = {
+        r"\byou're\b": 'you are',
+        r"\bdon't\b": 'do not',
+        r"\blet's\b": 'let us',
+        r"\bwhen's\b": 'when is',
+        r"\bthat's\b": 'that is',
+        r"\bit's\b": 'it is'
+    }
+    
+    for pattern, replacement in contractions.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    
+    # Break very long sentences at natural pause points
+    # Split sentences longer than 120 characters
+    sentences = re.split(r'([.!?])', text)
+    processed_sentences = []
+    
+    for i in range(0, len(sentences), 2):
+        if i + 1 < len(sentences):
+            sentence = sentences[i]
+            punctuation = sentences[i + 1]
+            
+            if len(sentence) > 120:
+                # Try to split at commas or other natural breaks
+                parts = sentence.split(', ')
+                if len(parts) > 1:
+                    # Rejoin as separate sentences
+                    for j, part in enumerate(parts):
+                        if j == len(parts) - 1:
+                            processed_sentences.append(part + punctuation)
+                        else:
+                            processed_sentences.append(part.strip() + '.')
+                else:
+                    processed_sentences.append(sentence + punctuation)
+            else:
+                processed_sentences.append(sentence + punctuation)
+        else:
+            processed_sentences.append(sentences[i])
+    
+    text = ' '.join(processed_sentences)
+    
+    # Clean up extra spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+
+def chunk_text_for_chatterbox(text: str, max_chunk_size: int = 300) -> list:
+    """
+    Split text into optimal chunks for Chatterbox TTS processing
+    
+    Args:
+        text: Input text to chunk
+        max_chunk_size: Maximum characters per chunk
+        
+    Returns:
+        List of text chunks
+    """
+    if len(text) <= max_chunk_size:
+        return [text]
+    
+    chunks = []
+    sentences = re.split(r'([.!?])', text)
+    current_chunk = ""
+
+    def append_with_hard_split(piece: str):
+        piece = piece.strip()
+        if not piece:
+            return
+        if len(piece) <= max_chunk_size:
+            chunks.append(piece)
+            return
+
+        # Hard-split very long pieces by words, then by characters if needed.
+        words = piece.split()
+        buf = ""
+        for w in words:
+            candidate = f"{buf} {w}".strip()
+            if len(candidate) <= max_chunk_size:
+                buf = candidate
+            else:
+                if buf:
+                    chunks.append(buf)
+                if len(w) <= max_chunk_size:
+                    buf = w
+                else:
+                    for i in range(0, len(w), max_chunk_size):
+                        chunks.append(w[i:i + max_chunk_size])
+                    buf = ""
+        if buf:
+            chunks.append(buf)
+    
+    for i in range(0, len(sentences), 2):
+        if i + 1 < len(sentences):
+            sentence = sentences[i].strip()
+            punctuation = sentences[i + 1]
+            full_sentence = sentence + punctuation
+            
+            # If adding this sentence would exceed chunk size, start new chunk
+            if len(current_chunk) + len(full_sentence) > max_chunk_size and current_chunk:
+                append_with_hard_split(current_chunk)
+                current_chunk = full_sentence
+            else:
+                current_chunk += " " + full_sentence if current_chunk else full_sentence
+        else:
+            # Handle case where there's a sentence without punctuation at the end
+            if sentences[i].strip():
+                if len(current_chunk) + len(sentences[i]) > max_chunk_size and current_chunk:
+                    append_with_hard_split(current_chunk)
+                    current_chunk = sentences[i].strip()
+                else:
+                    current_chunk += " " + sentences[i].strip() if current_chunk else sentences[i].strip()
+    
+    # Add the last chunk
+    if current_chunk.strip():
+        append_with_hard_split(current_chunk)
+
+    # Safety: never return an oversize chunk.
+    safe_chunks = []
+    for c in chunks:
+        if len(c) <= max_chunk_size:
+            safe_chunks.append(c)
+        else:
+            for i in range(0, len(c), max_chunk_size):
+                safe_chunks.append(c[i:i + max_chunk_size])
+
+    return safe_chunks if safe_chunks else [text[:max_chunk_size]]
+
+
+def chatterbox_tts(
+    text: str,
+    voice_name: str,
+    voice_rate: float,
+    voice_file: str,
+    voice_volume: float = 1.0,
+    allow_chunking: bool = True,
+) -> Union[SubMaker, None]:
+    """
+    ä½¿ç”¨Chatterbox TTS + WhisperXç”Ÿæˆè¯­éŸ³å’Œç²¾ç¡®çš„å•è¯æ—¶é—´æˆ³
+
+    Args:
+        text: è¦è½¬æ¢ä¸ºè¯­éŸ³çš„æ–‡æœ¬
+        voice_name: å£°éŸ³åç§°ï¼Œæ ¼å¼: "chatterbox:type:name-Gender"
+        voice_rate: è¯­éŸ³é€Ÿåº¦ï¼ˆæš‚ä¸æ”¯æŒè°ƒæ•´ï¼‰
+        voice_file: è¾“å‡ºçš„éŸ³é¢‘æ–‡ä»¶è·¯å¾„
+        voice_volume: è¯­éŸ³éŸ³é‡ï¼ˆæš‚ä¸æ”¯æŒè°ƒæ•´ï¼‰
+
+    Returns:
+        SubMakerå¯¹è±¡æˆ–None
+    """
+    if not CHATTERBOX_AVAILABLE:
+        logger.error("Chatterbox TTS is not available. Please install chatterbox-tts and whisperx.")
+        _set_last_tts_error("Chatterbox TTS is not available")
+        return None
+
+    text = text.strip()
+    if not text:
+        logger.error("Text is empty")
+        _set_last_tts_error("Text is empty")
+        return None
+
+    # Preprocess text to improve TTS quality
+    original_text = text
+    text = preprocess_text_for_chatterbox(text)
+    
+    # Check if text needs chunking (configurable threshold via CHATTERBOX_CHUNK_THRESHOLD)
+    # Higher threshold reduces chunking frequency which can affect speech pacing
+    chunk_threshold = int(os.environ.get("CHATTERBOX_CHUNK_THRESHOLD", "600"))
+    if allow_chunking and len(text) > chunk_threshold:
+        logger.warning(f"Text is too long ({len(text)} chars) for single-pass Chatterbox TTS")
+        logger.info("Automatically chunking text for better quality...")
+        return chatterbox_tts_chunked(text, voice_name, voice_rate, voice_file, voice_volume)
+    
+    logger.info(f"Chatterbox TTS input: '{text[:100]}...' (original: {len(original_text)} â†’ processed: {len(text)} chars)")
+
+    # è§£æžvoice_name: chatterbox:type:name-Gender
+    parts = voice_name.split(":")
+    if len(parts) < 3:
+        logger.error(f"Invalid Chatterbox voice name format: {voice_name}")
+        _set_last_tts_error(f"Invalid Chatterbox voice name format: {voice_name}")
+        return None
+
+    voice_type = parts[1]  # "default" or "clone"
+    voice_info = parts[2]  # "name-Gender"
+    voice_base_name = voice_info.split("-")[0]
+
+    # èŽ·å–è®¾å¤‡ - Use CPU by default to avoid cuDNN version conflicts
+    # Set CHATTERBOX_DEVICE=cuda environment variable to force GPU usage
+    force_device = os.environ.get("CHATTERBOX_DEVICE", "cpu").lower()
+    if force_device == "cuda" and torch.cuda.is_available():
+        device = "cuda"
+        logger.info(f"Using GPU device: {device} (forced via CHATTERBOX_DEVICE)")
+    else:
+        device = "cpu"
+        logger.info(f"Using CPU device (safe mode - set CHATTERBOX_DEVICE=cuda to use GPU)")
+
+    global chatterbox_model, whisperx_model
+
+    try:
+        # 1. åŠ è½½Chatterbox TTSæ¨¡åž‹
+        if chatterbox_model is None:
+            logger.info("Loading Chatterbox TTS model...")
+            try:
+                chatterbox_model = ChatterboxTTS.from_pretrained(device=device)
+                logger.info("Chatterbox TTS model loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load Chatterbox TTS model: {e}")
+                if device == "cuda":
+                    logger.info("Falling back to CPU mode...")
+                    device = "cpu"
+                    chatterbox_model = ChatterboxTTS.from_pretrained(device=device)
+                    logger.info("Chatterbox TTS model loaded successfully on CPU")
+                else:
+                    raise
+
+        # 2. ç”Ÿæˆè¯­éŸ³
+        logger.info(f"Generating speech with Chatterbox TTS, type: {voice_type}")
+        
+        audio_prompt_path = None
+        if voice_type == "clone" and voice_base_name != "Voice Clone":
+            # æŸ¥æ‰¾å‚è€ƒéŸ³é¢‘æ–‡ä»¶
+            reference_audio_dir = os.path.join(utils.root_dir(), "reference_audio")
+            for ext in ['.wav', '.mp3', '.flac', '.m4a']:
+                potential_path = os.path.join(reference_audio_dir, voice_base_name + ext)
+                if os.path.exists(potential_path):
+                    audio_prompt_path = potential_path
+                    break
+            
+            if audio_prompt_path:
+                logger.info(f"Using voice cloning with reference: {audio_prompt_path}")
+            else:
+                logger.warning(f"Reference audio not found for {voice_base_name}, using default voice")
+
+        # ç”Ÿæˆè¯­éŸ³ (with improved pacing control)
+        # Lower cfg_weight for slower, more natural pacing
+        # Environment variable CHATTERBOX_CFG_WEIGHT can override (default 0.2 for very slow speech)
+        cfg_weight = float(os.environ.get("CHATTERBOX_CFG_WEIGHT", "0.2"))
+        logger.info(f"Using cfg_weight={cfg_weight} for speech pacing control")
+        
+        if audio_prompt_path:
+            wav = chatterbox_model.generate(text, audio_prompt_path=audio_prompt_path, cfg_weight=cfg_weight)
+        else:
+            wav = chatterbox_model.generate(text, cfg_weight=cfg_weight)
+
+        # ä¿å­˜ä¸ºä¸´æ—¶WAVæ–‡ä»¶
+        temp_wav_file = voice_file.replace('.mp3', '_temp.wav')
+        torchaudio.save(temp_wav_file, wav, 24000)
+
+        # 3. Generate word timestamps with WhisperX
+        logger.info("Generating word timestamps with WhisperX")
+        
+        whisperx_unavailable = False
+        if whisperx_model is None:
+            logger.info("Loading WhisperX model...")
+            # Use appropriate compute type for CPU
+            compute_type = "int8" if device == "cpu" else "float16"
+            _prepare_torch_deserialization_for_whisperx()
+            try:
+                whisperx_model = whisperx.load_model("base", device, compute_type=compute_type)
+                logger.info(f"WhisperX model loaded successfully on {device} with {compute_type}")
+            except Exception as e:
+                logger.error(f"Failed to load WhisperX model on {device}: {e}")
+                if device == "cuda":
+                    logger.info("Falling back to CPU for WhisperX...")
+                    device = "cpu"
+                    compute_type = "int8"
+                    try:
+                        whisperx_model = whisperx.load_model("base", device, compute_type=compute_type)
+                        logger.info(f"WhisperX model loaded successfully on CPU with {compute_type}")
+                    except Exception as cpu_e:
+                        logger.error(f"Failed to load WhisperX model on CPU fallback: {cpu_e}")
+                        whisperx_unavailable = True
+                else:
+                    whisperx_unavailable = True
+
+        # Transcribe audio to get timestamps
+        result = {}
+        transcription_failed = whisperx_unavailable
+        audio = None
+        if whisperx_unavailable:
+            logger.warning("WhisperX is unavailable, falling back to sentence-level timing")
+        else:
+            try:
+                audio = whisperx.load_audio(temp_wav_file)
+                result = whisperx_model.transcribe(audio, batch_size=16)
+            except Exception as e:
+                logger.error(f"WhisperX transcription failed: {e}")
+                transcription_failed = True
+
+        # Validate transcription result
+        if not transcription_failed and (not result or "segments" not in result or not result["segments"]):
+            logger.warning("WhisperX transcription failed or returned empty result")
+            logger.debug(f"WhisperX result: {result}")
+            transcription_failed = True
+        elif not transcription_failed:
+            transcribed_text = " ".join([segment.get("text", "") for segment in result["segments"]]).strip()
+            logger.info(f"WhisperX transcribed: '{transcribed_text[:100]}...' (length: {len(transcribed_text)} chars)")
+            
+            # Check if transcription matches input text reasonably well
+            text_similarity = len(set(text.lower().split()) & set(transcribed_text.lower().split())) / max(len(text.split()), 1)
+            logger.debug(f"Text similarity score: {text_similarity:.2f}")
+            
+            if text_similarity < 0.3:
+                logger.warning(f"Transcription seems inaccurate (similarity: {text_similarity:.2f})")
+                if text_similarity < 0.1:
+                    logger.error(f"Transcription quality too poor (similarity: {text_similarity:.2f}), falling back to sentence-level timing")
+                    transcription_failed = True
+
+        # åŠ è½½å¯¹é½æ¨¡åž‹ (only if transcription is good)
+        if not transcription_failed:
+            try:
+                model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
+                result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
+            except Exception as e:
+                logger.error(f"WhisperX alignment failed: {e}")
+                transcription_failed = True
+
+        # 4. åˆ›å»ºSubMakerå¹¶å¡«å……æ—¶é—´æˆ³
+        sub_maker = ensure_submaker_compatibility(SubMaker())
+        
+        # Process word-level timestamps from WhisperX alignment (only if transcription is good)
+        word_count = 0
+        if not transcription_failed and "segments" in result and result["segments"]:
+            # Debug: Log the WhisperX result structure
+            logger.debug(f"WhisperX result keys: {list(result.keys())}")
+            logger.debug(f"Number of segments: {len(result['segments'])}")
+            if result["segments"]:
+                logger.debug(f"First segment keys: {list(result['segments'][0].keys())}")
+            
+            for segment in result["segments"]:
+                # Check if this segment has word-level alignments
+                if "words" in segment and segment["words"]:
+                    for word_info in segment["words"]:
+                        word = word_info.get("word", "").strip()
+                        start = word_info.get("start", None)
+                        end = word_info.get("end", None)
+                        
+                        # Skip words without proper timing or empty words
+                        if word and start is not None and end is not None and start < end:
+                            # è½¬æ¢ä¸º100çº³ç§’å•ä½ï¼ˆä¸Žedge_ttså…¼å®¹ï¼‰
+                            start_100ns = int(start * 10000000)
+                            end_100ns = int(end * 10000000)
+                            
+                            sub_maker.subs.append(word)
+                            sub_maker.offset.append((start_100ns, end_100ns))
+                            word_count += 1
+                        else:
+                            logger.debug(f"Skipping invalid word: '{word}', start: {start}, end: {end}")
+            
+            logger.info(f"Processed {word_count} word-level timestamps from WhisperX")
+        else:
+            logger.warning("Skipping word-level processing due to transcription issues")
+        
+        # å¦‚æžœæ²¡æœ‰èŽ·å–åˆ°å•è¯çº§æ—¶é—´æˆ³ï¼Œå›žé€€åˆ°å¥å­çº§ (enhanced fallback)
+        if not sub_maker.subs or transcription_failed:
+            if transcription_failed:
+                logger.info("Using sentence-level timing due to poor transcription quality")
+            else:
+                logger.warning("No word-level timestamps found, falling back to sentence-level")
+                
+            sentences = utils.split_string_by_punctuations(text)
+            audio_duration = len(wav[0]) / 24000  # é‡‡æ ·çŽ‡24000Hz
+            
+            if sentences:
+                total_chars = sum(len(s) for s in sentences)
+                char_duration = (audio_duration * 10000000) / total_chars if total_chars > 0 else 0
+                
+                current_offset = 0
+                for sentence in sentences:
+                    if not sentence.strip():
+                        continue
+                    
+                    sentence_chars = len(sentence)
+                    sentence_duration = int(sentence_chars * char_duration)
+                    
+                    sub_maker.subs.append(sentence.strip())
+                    sub_maker.offset.append((current_offset, current_offset + sentence_duration))
+                    current_offset += sentence_duration
+                    
+                logger.info(f"Generated {len(sub_maker.subs)} sentence-level timestamps")
+            else:
+                # æœ€åŽçš„å›žé€€æ–¹æ¡ˆ
+                audio_duration_100ns = int(audio_duration * 10000000)
+                sub_maker.subs = [text]
+                sub_maker.offset = [(0, audio_duration_100ns)]
+                logger.info("Using single timestamp for entire text")
+
+        # 5. è½¬æ¢éŸ³é¢‘æ ¼å¼ä¸ºMP3ï¼ˆå¦‚æžœéœ€è¦ï¼‰
+        final_audio_file = voice_file
+        if voice_file.endswith('.mp3'):
+            try:
+                from moviepy import AudioFileClip
+                logger.info("Converting WAV to MP3...")
+                audio_clip = AudioFileClip(temp_wav_file)
+                audio_clip.write_audiofile(voice_file, logger=None)  # Removed verbose parameter
+                audio_clip.close()
+                os.remove(temp_wav_file)  # åˆ é™¤ä¸´æ—¶WAVæ–‡ä»¶
+                logger.info("Audio conversion to MP3 completed")
+                final_audio_file = voice_file
+            except Exception as e:
+                logger.warning(f"Failed to convert to MP3, keeping WAV format: {e}")
+                # Keep the WAV file with original extension
+                final_audio_file = voice_file.replace('.mp3', '.wav')
+                os.rename(temp_wav_file, final_audio_file)
+                logger.info(f"Saved as WAV: {final_audio_file}")
+        else:
+            final_audio_file = voice_file
+            os.rename(temp_wav_file, voice_file)
+
+        # Log subtitle information for debugging
+        if sub_maker.subs:
+            logger.info(f"Generated {len(sub_maker.subs)} subtitle entries")
+            logger.debug(f"First few subtitle entries: {sub_maker.subs[:5]}")
+            logger.debug(f"First few timing offsets: {sub_maker.offset[:5]}")
+            
+            # Validate subtitle timing
+            total_audio_duration = len(wav[0]) / 24000
+            last_subtitle_time = sub_maker.offset[-1][1] / 10000000 if sub_maker.offset else 0
+            logger.info(f"Audio duration: {total_audio_duration:.2f}s, Last subtitle time: {last_subtitle_time:.2f}s")
+            
+            # Final quality check
+            if transcription_failed:
+                logger.warning("âš ï¸  Chatterbox TTS transcription had quality issues. Consider:")
+                logger.warning("   â€¢ Using shorter, simpler text")
+                logger.warning("   â€¢ Trying Azure TTS for better accuracy")
+                logger.warning("   â€¢ Using CPU mode (set CHATTERBOX_DEVICE=cpu)")
+        else:
+            logger.warning("No subtitles generated!")
+
+        logger.success(f"Chatterbox TTS completed with {len(sub_maker.subs)} word/sentence timestamps")
+        logger.info(f"Output file: {final_audio_file}")
+        
+        # Store the actual file path for downstream processing
+        sub_maker._actual_audio_file = final_audio_file
+        sub_maker._transcription_quality_warning = transcription_failed
+        
+        return sub_maker
+
+    except Exception as e:
+        logger.exception("Chatterbox TTS failed")
+        _set_last_tts_error(str(e))
+        # æ¸…ç†ä¸´æ—¶æ–‡ä»¶
+        temp_wav_file = voice_file.replace('.mp3', '_temp.wav')
+        if os.path.exists(temp_wav_file):
+            os.remove(temp_wav_file)
+        return None
+
+
+def chatterbox_tts_chunked(
+    text: str,
+    voice_name: str,
+    voice_rate: float,
+    voice_file: str,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    """
+    Handle long texts by chunking them into smaller pieces for Chatterbox TTS
+    
+    This prevents garbled audio that occurs when text is too long
+    """
+    logger.info("ðŸ”„ Starting chunked Chatterbox TTS processing")
+    
+    # Split text into optimal chunks
+    chunks = chunk_text_for_chatterbox(text, max_chunk_size=300)
+    logger.info(f"Split text into {len(chunks)} chunks (max 300 chars each)")
+    
+    if len(chunks) == 1:
+        # Avoid recursive loop: process directly without re-entering chunk mode.
+        return chatterbox_tts(
+            chunks[0],
+            voice_name,
+            voice_rate,
+            voice_file,
+            voice_volume,
+            allow_chunking=False,
+        )
+    
+    # Generate audio for each chunk
+    temp_audio_files = []
+    all_sub_makers = []
+    cumulative_duration = 0.0
+    
+    try:
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
+            
+            # Create temporary file for this chunk
+            chunk_file = voice_file.replace('.mp3', f'_chunk_{i}.mp3')
+            
+            # Generate TTS for this chunk
+            chunk_result = chatterbox_tts(
+                chunk,
+                voice_name,
+                voice_rate,
+                chunk_file,
+                voice_volume,
+                allow_chunking=False,
+            )
+            
+            if chunk_result:
+                chunk_audio_file = getattr(chunk_result, '_actual_audio_file', chunk_file)
+                temp_audio_files.append(chunk_audio_file)
+                
+                # Adjust timing offsets to account for previous chunks
+                adjusted_subs = []
+                adjusted_offsets = []
+                
+                cumulative_offset_100ns = int(cumulative_duration * 10000000)
+                
+                for sub, (start, end) in zip(chunk_result.subs, chunk_result.offset):
+                    adjusted_subs.append(sub)
+                    adjusted_offsets.append((
+                        start + cumulative_offset_100ns,
+                        end + cumulative_offset_100ns
+                    ))
+                
+                # Create adjusted SubMaker for this chunk
+                adjusted_sub_maker = ensure_submaker_compatibility(SubMaker())
+                adjusted_sub_maker.subs = adjusted_subs
+                adjusted_sub_maker.offset = adjusted_offsets
+                all_sub_makers.append(adjusted_sub_maker)
+                
+                # Update cumulative duration
+                if chunk_result.offset:
+                    chunk_duration = chunk_result.offset[-1][1] / 10000000
+                    cumulative_duration += chunk_duration
+                    
+                logger.info(f"Chunk {i+1} completed: {len(chunk_result.subs)} entries, {chunk_duration:.2f}s")
+            else:
+                logger.error(f"Failed to generate chunk {i+1}")
+                return None
+        
+        # Combine all audio files
+        logger.info("ðŸŽµ Combining audio chunks...")
+        combined_audio = combine_audio_files(temp_audio_files, voice_file)
+        
+        if combined_audio:
+            # Combine all SubMakers
+            final_sub_maker = ensure_submaker_compatibility(SubMaker())
+            final_sub_maker.subs = []
+            final_sub_maker.offset = []
+            
+            for sub_maker in all_sub_makers:
+                final_sub_maker.subs.extend(sub_maker.subs)
+                final_sub_maker.offset.extend(sub_maker.offset)
+            
+            # Set metadata
+            final_sub_maker._actual_audio_file = combined_audio
+            final_sub_maker._transcription_quality_warning = any(
+                getattr(sm, '_transcription_quality_warning', False) for sm in all_sub_makers
+            )
+            
+            logger.success(f"âœ… Chunked TTS completed: {len(final_sub_maker.subs)} total entries, {cumulative_duration:.2f}s")
+            logger.info(f"Combined audio file: {combined_audio}")
+            
+            return final_sub_maker
+        else:
+            logger.error("Failed to combine audio chunks")
+            return None
+            
+    finally:
+        # Clean up temporary chunk files
+        for temp_file in temp_audio_files:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                    logger.debug(f"Cleaned up temporary file: {temp_file}")
+                except Exception as e:
+                    logger.warning(f"Could not remove temporary file {temp_file}: {e}")
+
+
+def combine_audio_files(audio_files: list, output_file: str) -> str:
+    """
+    Combine multiple audio files into a single file
+    
+    Args:
+        audio_files: List of audio file paths to combine
+        output_file: Output file path
+        
+    Returns:
+        Path to combined audio file or None if failed
+    """
+    try:
+        from moviepy import AudioFileClip, concatenate_audioclips
+        
+        logger.info(f"Combining {len(audio_files)} audio files...")
+        
+        # Load all audio clips
+        audio_clips = []
+        for audio_file in audio_files:
+            if os.path.exists(audio_file):
+                clip = AudioFileClip(audio_file)
+                audio_clips.append(clip)
+                logger.debug(f"Loaded audio clip: {audio_file} ({clip.duration:.2f}s)")
+            else:
+                logger.warning(f"Audio file not found: {audio_file}")
+        
+        if not audio_clips:
+            logger.error("No valid audio clips to combine")
+            return None
+        
+        # Concatenate all clips
+        final_audio = concatenate_audioclips(audio_clips)
+        
+        # Write combined audio
+        final_audio.write_audiofile(output_file, logger=None)
+        
+        # Clean up clips
+        for clip in audio_clips:
+            clip.close()
+        final_audio.close()
+        
+        logger.info(f"Successfully combined audio: {output_file} ({final_audio.duration:.2f}s)")
+        return output_file
+        
+    except Exception as e:
+        logger.error(f"Failed to combine audio files: {e}")
+        return None
+
+
+def azure_tts_v2(text: str, voice_name: str, voice_file: str) -> Union[SubMaker, None]:
+    voice_name = is_azure_v2_voice(voice_name)
+    if not voice_name:
+        logger.error(f"invalid voice name: {voice_name}")
+        raise ValueError(f"invalid voice name: {voice_name}")
+    text = text.strip()
+
+    def _format_duration_to_offset(duration) -> int:
+        if isinstance(duration, str):
+            time_obj = datetime.strptime(duration, "%H:%M:%S.%f")
+            milliseconds = (
+                (time_obj.hour * 3600000)
+                + (time_obj.minute * 60000)
+                + (time_obj.second * 1000)
+                + (time_obj.microsecond // 1000)
+            )
+            return milliseconds * 10000
+
+        if isinstance(duration, int):
+            return duration
+
+        return 0
+
+    for i in range(3):
+        try:
+            logger.info(f"start, voice name: {voice_name}, try: {i + 1}")
+
+            import azure.cognitiveservices.speech as speechsdk
+
+            sub_maker = ensure_submaker_compatibility(SubMaker())
+
+            def speech_synthesizer_word_boundary_cb(evt: speechsdk.SessionEventArgs):
+                # print('WordBoundary event:')
+                # print('\tBoundaryType: {}'.format(evt.boundary_type))
+                # print('\tAudioOffset: {}ms'.format((evt.audio_offset + 5000)))
+                # print('\tDuration: {}'.format(evt.duration))
+                # print('\tText: {}'.format(evt.text))
+                # print('\tTextOffset: {}'.format(evt.text_offset))
+                # print('\tWordLength: {}'.format(evt.word_length))
+
+                duration = _format_duration_to_offset(str(evt.duration))
+                offset = _format_duration_to_offset(evt.audio_offset)
+                sub_maker.subs.append(evt.text)
+                sub_maker.offset.append((offset, offset + duration))
+
+            # Creates an instance of a speech config with specified subscription key and service region.
+            speech_key = config.azure.get("speech_key", "")
+            service_region = config.azure.get("speech_region", "")
+            if not speech_key or not service_region:
+                logger.error("Azure speech key or region is not set")
+                _set_last_tts_error("Azure TTS V2 requires speech_key and speech_region in config.toml")
+                return None
+
+            audio_config = speechsdk.audio.AudioOutputConfig(
+                filename=voice_file, use_default_speaker=True
+            )
+            speech_config = speechsdk.SpeechConfig(
+                subscription=speech_key, region=service_region
+            )
+            speech_config.speech_synthesis_voice_name = voice_name
+            # speech_config.set_property(property_id=speechsdk.PropertyId.SpeechServiceResponse_RequestSentenceBoundary,
+            #                            value='true')
+            speech_config.set_property(
+                property_id=speechsdk.PropertyId.SpeechServiceResponse_RequestWordBoundary,
+                value="true",
+            )
+
+            speech_config.set_speech_synthesis_output_format(
+                speechsdk.SpeechSynthesisOutputFormat.Audio48Khz192KBitRateMonoMp3
+            )
+            speech_synthesizer = speechsdk.SpeechSynthesizer(
+                audio_config=audio_config, speech_config=speech_config
+            )
+            speech_synthesizer.synthesis_word_boundary.connect(
+                speech_synthesizer_word_boundary_cb
+            )
+
+            result = speech_synthesizer.speak_text_async(text).get()
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                logger.success(f"azure v2 speech synthesis succeeded: {voice_file}")
+                return sub_maker
+            elif result.reason == speechsdk.ResultReason.Canceled:
+                cancellation_details = result.cancellation_details
+                logger.error(
+                    f"azure v2 speech synthesis canceled: {cancellation_details.reason}"
+                )
+                if cancellation_details.reason == speechsdk.CancellationReason.Error:
+                    logger.error(
+                        f"azure v2 speech synthesis error: {cancellation_details.error_details}"
+                    )
+                    _set_last_tts_error(
+                        f"azure_tts_v2 canceled: {cancellation_details.error_details}"
+                    )
+            logger.info(f"completed, output file: {voice_file}")
+        except Exception as e:
+            logger.error(f"failed, error: {str(e)}")
+            _set_last_tts_error(f"azure_tts_v2 failed: {str(e)}")
+    return None
+
+
+def _format_text(text: str) -> str:
+    # text = text.replace("\n", " ")
+    text = text.replace("[", " ")
+    text = text.replace("]", " ")
+    text = text.replace("(", " ")
+    text = text.replace(")", " ")
+    text = text.replace("{", " ")
+    text = text.replace("}", " ")
+    text = text.strip()
+    return text
+
+
+def create_chatterbox_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):
+    """
+    Create subtitle file optimized for Chatterbox TTS timestamps
+    Handles both word-level and sentence-level timestamps intelligently
+    """
+    if not sub_maker.subs or not sub_maker.offset:
+        logger.warning("No subtitle data available")
+        return
+
+    def mktimestamp(seconds: float) -> str:
+        """Convert seconds to SRT timestamp format"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millisecs = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
+
+    def formatter(idx: int, start_time: float, end_time: float, sub_text: str) -> str:
+        """Format subtitle entry for SRT file"""
+        start_t = mktimestamp(start_time)
+        end_t = mktimestamp(end_time)
+        return f"{idx}\n{start_t} --> {end_t}\n{sub_text}\n"
+
+    try:
+        subtitle_entries = []
+        subtitle_index = 1
+
+        # Detect if we have word-level or sentence-level timestamps
+        avg_sub_length = sum(len(sub) for sub in sub_maker.subs) / len(sub_maker.subs)
+        is_word_level = avg_sub_length < 15  # Average word length is typically < 15 chars
+        
+        if is_word_level:
+            logger.info("Processing word-level timestamps for subtitle grouping")
+            current_phrase = []
+            current_start_time = None
+            current_end_time = None
+
+            # Group words into phrases
+            for i, (word, (start_100ns, end_100ns)) in enumerate(zip(sub_maker.subs, sub_maker.offset)):
+                start_time = start_100ns / 10000000  # Convert to seconds
+                end_time = end_100ns / 10000000
+
+                if current_start_time is None:
+                    current_start_time = start_time
+
+                current_phrase.append(word)
+                current_end_time = end_time
+
+                # End phrase on punctuation or every 8-10 words
+                is_punctuation_end = word.rstrip().endswith(('.', '!', '?', 'ã€‚', 'ï¼', 'ï¼Ÿ'))
+                is_comma_pause = word.rstrip().endswith((',', 'ï¼Œ'))
+                is_long_phrase = len(current_phrase) >= 8
+                is_last_word = i == len(sub_maker.subs) - 1
+
+                if is_punctuation_end or is_long_phrase or is_last_word or (is_comma_pause and len(current_phrase) >= 4):
+                    if current_phrase:
+                        phrase_text = ' '.join(current_phrase).strip()
+                        # Clean up spacing around punctuation
+                        phrase_text = re.sub(r'\s+([,.!?ã€‚ï¼Œï¼ï¼Ÿ])', r'\1', phrase_text)
+                        
+                        subtitle_entry = formatter(
+                            idx=subtitle_index,
+                            start_time=current_start_time,
+                            end_time=current_end_time,
+                            sub_text=phrase_text
+                        )
+                        subtitle_entries.append(subtitle_entry)
+                        subtitle_index += 1
+
+                    # Reset for next phrase
+                    current_phrase = []
+                    current_start_time = None
+        else:
+            logger.info("Processing sentence-level timestamps directly")
+            # Use sentence-level timestamps as-is
+            for i, (sentence, (start_100ns, end_100ns)) in enumerate(zip(sub_maker.subs, sub_maker.offset)):
+                start_time = start_100ns / 10000000
+                end_time = end_100ns / 10000000
+                
+                subtitle_entry = formatter(
+                    idx=subtitle_index,
+                    start_time=start_time,
+                    end_time=end_time,
+                    sub_text=sentence.strip()
+                )
+                subtitle_entries.append(subtitle_entry)
+                subtitle_index += 1
+
+        # Write subtitle file
+        if subtitle_entries:
+            with open(subtitle_file, "w", encoding="utf-8") as file:
+                file.write("\n".join(subtitle_entries))
+            
+            logger.success(f"Chatterbox subtitle file created: {subtitle_file} with {len(subtitle_entries)} entries")
+        else:
+            logger.warning("No subtitle entries created")
+
+    except Exception as e:
+        logger.error(f"Failed to create Chatterbox subtitle: {str(e)}")
+        import traceback
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+
+
+def create_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):
+    """
+    ä¼˜åŒ–å­—å¹•æ–‡ä»¶
+    1. å°†å­—å¹•æ–‡ä»¶æŒ‰ç…§æ ‡ç‚¹ç¬¦å·åˆ†å‰²æˆå¤šè¡Œ
+    2. é€è¡ŒåŒ¹é…å­—å¹•æ–‡ä»¶ä¸­çš„æ–‡æœ¬
+    3. ç”Ÿæˆæ–°çš„å­—å¹•æ–‡ä»¶
+    
+    Note: This function is optimized for Azure TTS phrase-level chunks.
+    For Chatterbox TTS word-level timestamps, use create_chatterbox_subtitle instead.
+    """
+
+    text = _format_text(text)
+
+    def formatter(idx: int, start_time: float, end_time: float, sub_text: str) -> str:
+        """
+        1
+        00:00:00,000 --> 00:00:02,360
+        è·‘æ­¥æ˜¯ä¸€é¡¹ç®€å•æ˜“è¡Œçš„è¿åŠ¨
+        """
+        start_t = mktimestamp(start_time).replace(".", ",")
+        end_t = mktimestamp(end_time).replace(".", ",")
+        return f"{idx}\n{start_t} --> {end_t}\n{sub_text}\n"
+
+    start_time = -1.0
+    sub_items = []
+    sub_index = 0
+
+    script_lines = utils.split_string_by_punctuations(text)
+
+    def match_line(_sub_line: str, _sub_index: int):
+        if len(script_lines) <= _sub_index:
+            return ""
+
+        _line = script_lines[_sub_index]
+        if _sub_line == _line:
+            return script_lines[_sub_index].strip()
+
+        _sub_line_ = re.sub(r"[^\w\s]", "", _sub_line)
+        _line_ = re.sub(r"[^\w\s]", "", _line)
+        if _sub_line_ == _line_:
+            return _line_.strip()
+
+        _sub_line_ = re.sub(r"\W+", "", _sub_line)
+        _line_ = re.sub(r"\W+", "", _line)
+        if _sub_line_ == _line_:
+            return _line.strip()
+
+        return ""
+
+    sub_line = ""
+
+    try:
+        for _, (offset, sub) in enumerate(zip(sub_maker.offset, sub_maker.subs)):
+            _start_time, end_time = offset
+            if start_time < 0:
+                start_time = _start_time
+
+            sub = unescape(sub)
+            sub_line += sub
+            sub_text = match_line(sub_line, sub_index)
+            if sub_text:
+                sub_index += 1
+                line = formatter(
+                    idx=sub_index,
+                    start_time=start_time,
+                    end_time=end_time,
+                    sub_text=sub_text,
+                )
+                sub_items.append(line)
+                start_time = -1.0
+                sub_line = ""
+
+        if len(sub_items) == len(script_lines):
+            with open(subtitle_file, "w", encoding="utf-8") as file:
+                file.write("\n".join(sub_items) + "\n")
+            try:
+                sbs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
+                duration = max([tb for ((ta, tb), txt) in sbs])
+                logger.info(
+                    f"completed, subtitle file created: {subtitle_file}, duration: {duration}"
+                )
+            except Exception as e:
+                logger.error(f"failed, error: {str(e)}")
+                os.remove(subtitle_file)
+        else:
+            logger.warning(
+                f"subtitle/script mismatch, using offset-based fallback. "
+                f"sub_items len: {len(sub_items)}, script_lines len: {len(script_lines)}"
+            )
+
+            # Fallback: always emit subtitle directly from TTS offsets to preserve sync.
+            # Offsets may be either 100ns ticks or seconds.
+            fallback_items = []
+            for i, ((raw_start, raw_end), sub_text) in enumerate(
+                zip(sub_maker.offset, sub_maker.subs), start=1
+            ):
+                if raw_start is None or raw_end is None:
+                    continue
+                start_time = float(raw_start)
+                end_time = float(raw_end)
+                # Heuristic unit detection: edge/azure usually produce 100ns ticks.
+                if end_time > 1000:
+                    start_time /= 10000000.0
+                    end_time /= 10000000.0
+                if end_time <= start_time:
+                    continue
+                line = formatter(
+                    idx=i,
+                    start_time=start_time,
+                    end_time=end_time,
+                    sub_text=unescape(str(sub_text)).strip(),
+                )
+                fallback_items.append(line)
+
+            if fallback_items:
+                with open(subtitle_file, "w", encoding="utf-8") as file:
+                    file.write("\n".join(fallback_items) + "\n")
+                logger.info(
+                    f"fallback subtitle file created: {subtitle_file}, entries: {len(fallback_items)}"
+                )
+            else:
+                logger.error("failed to create fallback subtitle: no valid offset entries")
+
+    except Exception as e:
+        logger.error(f"failed, error: {str(e)}")
+
+
+def get_audio_duration(sub_maker: SubMaker):
+    """
+    èŽ·å–éŸ³é¢‘æ—¶é•¿
+    """
+    if not sub_maker.offset:
+        return 0.0
+    return sub_maker.offset[-1][1] / 10000000
+
+
+# Note: This module contains TTS functions for Azure TTS V1/V2, SiliconFlow TTS, and Chatterbox TTS
+# All functions are optimized for production use with proper error handling and fallbacks
+
