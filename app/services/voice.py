@@ -158,6 +158,63 @@ def get_chatterbox_voices() -> list[str]:
     return voices
 
 
+def get_openai_compatible_voices() -> list[str]:
+    voices_cfg = config.ui.get("openai_compatible_voices", [])
+    voices: list[str] = []
+    if isinstance(voices_cfg, list):
+        for item in voices_cfg:
+            if isinstance(item, dict):
+                voice_id = str(item.get("id", "")).strip()
+                voice_name = str(item.get("name", "")).strip()
+                if voice_id:
+                    voices.append(f"openai:{voice_id}:{voice_name or voice_id}")
+    if not voices:
+        voices = ["openai:default:default"]
+    return voices
+
+
+def is_openai_compatible_voice(voice_name: str) -> bool:
+    return str(voice_name or "").startswith("openai:")
+
+
+def is_openai_compatible_server() -> bool:
+    return config.ui.get("tts_server", "") == "openai-compatible"
+
+
+def parse_openai_compatible_voice(voice_name: str) -> str:
+    if not voice_name:
+        return "default"
+    if voice_name.startswith("openai:"):
+        parts = voice_name.split(":")
+        if len(parts) >= 2 and parts[1].strip():
+            return parts[1].strip()
+    return voice_name.strip() or "default"
+
+
+def _build_openai_tts_url(base_url: str) -> str:
+    base = (base_url or "http://127.0.0.1:8000/v1").strip().rstrip("/")
+    if base.endswith("/audio/speech"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/audio/speech"
+    return f"{base}/v1/audio/speech"
+
+
+def check_openai_compatible_connection(base_url: str = "", api_key: str = "") -> tuple[bool, str]:
+    tts_url = _build_openai_tts_url(base_url or config.ui.get("tts_base_url", ""))
+    health_url = tts_url.replace("/v1/audio/speech", "/health").replace("/audio/speech", "/health")
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        response = requests.get(health_url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            return True, "Connected"
+        return False, f"Disconnected ({response.status_code})"
+    except requests.RequestException as e:
+        return False, f"Disconnected ({str(e)})"
+
+
 def get_all_azure_voices(filter_locals=None) -> list[str]:
     azure_voices_str = """
 Name: af-ZA-AdriNeural
@@ -1206,6 +1263,17 @@ def tts(
     voice_volume: float = 1.0,
 ) -> Union[SubMaker, None]:
     _set_last_tts_error("")
+    if is_openai_compatible_server() or is_openai_compatible_voice(voice_name):
+        selected_voice = parse_openai_compatible_voice(voice_name)
+        sub = openai_compatible_tts(text, selected_voice, voice_rate, voice_file)
+        if sub:
+            return sub
+        if bool(config.ui.get("auto_fallback_to_edge_tts", True)):
+            fallback_voice = config.ui.get(
+                "fallback_voice_name", "vi-VN-HoaiMyNeural-Female"
+            )
+            return azure_tts_v1(text, fallback_voice, voice_rate, voice_file)
+        return None
     if is_azure_v2_voice(voice_name):
         return azure_tts_v2(text, voice_name, voice_file)
     elif is_siliconflow_voice(voice_name):
@@ -1231,6 +1299,78 @@ def tts(
         # æ ¼å¼: chatterbox:type:name-Gender
         return chatterbox_tts(text, voice_name, voice_rate, voice_file, voice_volume)
     return azure_tts_v1(text, voice_name, voice_rate, voice_file)
+
+
+def openai_compatible_tts(
+    text: str,
+    voice_name: str,
+    voice_rate: float,
+    voice_file: str,
+) -> Union[SubMaker, None]:
+    text = (text or "").strip()
+    if not text:
+        _set_last_tts_error("OpenAI-compatible TTS failed: input text is empty")
+        return None
+
+    base_url = config.ui.get("tts_base_url", "http://127.0.0.1:8000/v1")
+    api_key = config.ui.get("tts_api_key", "")
+    model = config.ui.get("tts_model", "vieneu-tts")
+    timeout_sec = int(config.ui.get("tts_timeout_seconds", 120))
+    timeout_sec = max(10, min(timeout_sec, 600))
+    url = _build_openai_tts_url(base_url)
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": model,
+        "text": text,
+        "voice": voice_name or "default",
+        "response_format": "wav",
+        "speed": float(voice_rate),
+    }
+
+    for i in range(10):
+        try:
+            logger.info(f"start openai-compatible tts, url: {url}, try: {i + 1}")
+            response = requests.post(url, json=payload, headers=headers, timeout=timeout_sec)
+            if response.status_code != 200:
+                err = (
+                    f"OpenAI-compatible TTS failed with status {response.status_code}: "
+                    f"{response.text[:300]}"
+                )
+                _set_last_tts_error(err)
+                logger.error(err)
+                continue
+
+            with open(voice_file, "wb") as f:
+                f.write(response.content)
+
+            sub_maker = ensure_submaker_compatibility(SubMaker())
+            try:
+                from moviepy import AudioFileClip
+
+                clip = AudioFileClip(voice_file)
+                audio_duration_100ns = int(clip.duration * 10000000)
+                clip.close()
+            except Exception:
+                audio_duration_100ns = 10000000
+            sub_maker.subs = [text]
+            sub_maker.offset = [(0, audio_duration_100ns)]
+            return sub_maker
+        except requests.Timeout:
+            err = f"OpenAI-compatible TTS timeout after {timeout_sec}s"
+            _set_last_tts_error(err)
+            logger.error(err)
+        except requests.RequestException as e:
+            err = f"OpenAI-compatible TTS connection error: {str(e)}"
+            _set_last_tts_error(err)
+            logger.error(err)
+        except Exception as e:
+            err = f"OpenAI-compatible TTS failed: {str(e)}"
+            _set_last_tts_error(err)
+            logger.error(err)
+    return None
 
 
 def convert_rate_to_percent(rate: float) -> str:

@@ -861,6 +861,7 @@ with middle_panel:
 
         # 添加TTS服务器选择下拉框
         tts_servers = [
+            ("openai-compatible", "OpenAI-Compatible TTS (VieNeu)"),
             ("azure-tts-v1", "Azure TTS V1"),
             ("azure-tts-v2", "Azure TTS V2"),
             ("siliconflow", "SiliconFlow TTS"),
@@ -906,7 +907,9 @@ with middle_panel:
         # 根据选择的TTS服务器获取声音列表
         filtered_voices = []
 
-        if selected_tts_server == "siliconflow":
+        if selected_tts_server == "openai-compatible":
+            filtered_voices = voice.get_openai_compatible_voices()
+        elif selected_tts_server == "siliconflow":
             # 获取硅基流动的声音列表
             filtered_voices = voice.get_siliconflow_voices()
         elif selected_tts_server == "chatterbox":
@@ -1058,6 +1061,10 @@ with middle_panel:
                     st.audio(audio_file, format="audio/mp3")
                     if os.path.exists(audio_file):
                         os.remove(audio_file)
+                else:
+                    tts_err = voice.get_last_tts_error()
+                    if tts_err:
+                        st.error(f"TTS Error: {tts_err}")
 
         # 当选择V2版本或者声音是V2声音时，显示服务区域和API key输入框
         if selected_tts_server == "azure-tts-v2" or (
